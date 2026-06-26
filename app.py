@@ -15,6 +15,9 @@ from ultralytics import YOLO
 import threading
 import os
 from pathlib import Path
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
+import av
+import queue
 
 # Resolve project root regardless of where Streamlit is launched from
 BASE_DIR = Path(__file__).parent.resolve()
@@ -317,6 +320,52 @@ def make_chart_layout(**overrides):
     return base
 
 
+# ── WebRTC Video Processor ────────────────────────────────────────────────────
+class PPEVideoProcessor(VideoProcessorBase):
+    """Processes each webcam frame through YOLO PPE detection.
+
+    Runs in a background thread managed by streamlit-webrtc.
+    Pushes detection results to a thread-safe queue so the main
+    Streamlit thread can display metrics and fire email alerts.
+    """
+
+    def __init__(self):
+        self.confidence_threshold = 0.5
+        self.result_queue: queue.Queue = queue.Queue(maxsize=10)
+        self._model = None
+        self._ppe_system: PPEDetectionSystem | None = None
+
+    def set_ppe_system(self, ppe_system: PPEDetectionSystem, confidence: float):
+        """Called from the main thread after the streamer is created."""
+        self._ppe_system = ppe_system
+        self._model = ppe_system.model
+        self.confidence_threshold = confidence
+
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        img = frame.to_ndarray(format="bgr24")
+
+        if self._ppe_system and self._model:
+            annotated, detections = self._ppe_system.detect_objects(
+                img, self.confidence_threshold
+            )
+            score = self._ppe_system.calculate_compliance_score(detections)
+
+            # Push result; drop oldest if full (non-blocking)
+            result = {"detections": detections, "score": score, "frame": annotated}
+            try:
+                self.result_queue.put_nowait(result)
+            except queue.Full:
+                try:
+                    self.result_queue.get_nowait()  # discard oldest
+                except queue.Empty:
+                    pass
+                self.result_queue.put_nowait(result)
+
+            return av.VideoFrame.from_ndarray(annotated, format="bgr24")
+
+        return frame
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
     st.markdown('<div class="main-header">PPE Safety Detection</div>', unsafe_allow_html=True)
@@ -324,7 +373,6 @@ def main():
                 unsafe_allow_html=True)
 
     if 'ppe_system'    not in st.session_state: st.session_state.ppe_system    = PPEDetectionSystem()
-    if 'running'       not in st.session_state: st.session_state.running       = False
     if 'model_loaded'  not in st.session_state: st.session_state.model_loaded  = False
 
     sys = st.session_state.ppe_system
@@ -401,73 +449,77 @@ def main():
     # ── Tabs ──────────────────────────────────────────────────────────────────
     tab1, tab2, tab3, tab4 = st.tabs(["🎥 Live Detection", "📊 Analytics", "📋 Check Log", "📁 File Upload"])
 
-    # ── Tab 1: Live Detection ─────────────────────────────────────────────────
+    # ── Tab 1: Live Detection (WebRTC) ─────────────────────────────────────────
     with tab1:
-        st.markdown('<div class="section-title">Camera Feed</div>', unsafe_allow_html=True)
-        c1, c2, c3 = st.columns([2,1,1])
-        with c1: camera_source = st.selectbox("Source", [0,1,2], label_visibility="collapsed")
-        with c2: start_btn = st.button("Start", type="primary", use_container_width=True)
-        with c3: stop_btn  = st.button("Stop",  use_container_width=True)
+        st.markdown('<div class="section-title">Browser Camera Feed</div>', unsafe_allow_html=True)
 
-        if start_btn: st.session_state.running = True
-        if stop_btn:  st.session_state.running = False
+        if not sys.model:
+            st.warning("Model not loaded. Click **Reload Model** in the sidebar.")
+        else:
+            st.caption("Click **START** below to open your browser webcam. "
+                       "Your browser will ask for camera permission.")
 
-        metrics_ph = st.empty()
-        alert_ph   = st.empty()
-        video_ph   = st.empty()
+            # Create the WebRTC streamer
+            ctx = webrtc_streamer(
+                key="ppe-detection",
+                mode=WebRtcMode.SENDRECV,
+                video_processor_factory=PPEVideoProcessor,
+                media_stream_constraints={"video": True, "audio": False},
+                async_processing=True,
+                rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+            )
 
-        if st.session_state.running:
-            if not sys.model:
-                st.warning("Model not loaded. Check path in sidebar.")
-            else:
-                cap = cv2.VideoCapture(camera_source)
-                if not cap.isOpened():
-                    st.error("Cannot access camera.")
-                    st.session_state.running = False
-                else:
-                    try:
-                        while st.session_state.running:
-                            ret, frame = cap.read()
-                            if not ret: break
+            # Inject the PPE system + confidence into the processor once it's alive
+            if ctx.video_processor:
+                ctx.video_processor.set_ppe_system(sys, confidence_threshold)
 
-                            annotated, detections = sys.detect_objects(frame, confidence_threshold)
-                            score = sys.calculate_compliance_score(detections)
-                            sys.log_detection(detections, score)
+            # ── Live metrics & alerts area ────────────────────────────────────
+            metrics_ph = st.empty()
+            alert_ph   = st.empty()
 
-                            with metrics_ph.container():
-                                st.markdown(
-                                    '<div class="metrics-row">' +
-                                    metric_card(ICO_PEOPLE,  detections['person'],     "People",       "blue")   +
-                                    metric_card(ICO_HARDHAT, detections['hardhat'],     "Hardhats",     "orange") +
-                                    metric_card(ICO_MASK,    detections['mask'],        "Masks",        "green")  +
-                                    metric_card(ICO_VEST,    detections['safety_vest'], "Safety Vests", "purple") +
-                                    metric_card(ICO_CHECK,   f"{score:.0f}%",           "Compliance",
-                                                "green" if score >= 90 else "red") +
-                                    '</div>', unsafe_allow_html=True)
+            if ctx.state.playing and ctx.video_processor:
+                # Drain the result queue and show latest detections
+                latest = None
+                try:
+                    while True:
+                        latest = ctx.video_processor.result_queue.get_nowait()
+                except queue.Empty:
+                    pass
 
-                            if   score >= 90: level,msg = "success","Excellent Safety Compliance!"
-                            elif score >= 70: level,msg = "warning","Good Compliance – minor issues."
-                            else:             level,msg = "danger", "Poor Compliance – immediate action required!"
-                            alert_ph.markdown(alert_banner(level, msg), unsafe_allow_html=True)
+                if latest:
+                    detections = latest["detections"]
+                    score      = latest["score"]
+                    sys.log_detection(detections, score)
 
-                            video_ph.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
-                                           channels="RGB", use_container_width=True)
+                    with metrics_ph.container():
+                        st.markdown(
+                            '<div class="metrics-row">' +
+                            metric_card(ICO_PEOPLE,  detections['person'],     "People",       "blue")   +
+                            metric_card(ICO_HARDHAT, detections['hardhat'],     "Hardhats",     "orange") +
+                            metric_card(ICO_MASK,    detections['mask'],        "Masks",        "green")  +
+                            metric_card(ICO_VEST,    detections['safety_vest'], "Safety Vests", "purple") +
+                            metric_card(ICO_CHECK,   f"{score:.0f}%",           "Compliance",
+                                        "green" if score >= 90 else "red") +
+                            '</div>', unsafe_allow_html=True)
 
-                            # Email: only when BOTH cooldown elapsed AND compliance < threshold
-                            if email_alerts and detections['violations'] and score < alert_compliance_threshold:
-                                for v in detections['violations']:
-                                    ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-                                    img = os.path.join(PHOTO_DIR,
-                                                       f"violation_{v['type'].replace(' ','_')}_{ts}.jpg")
-                                    cv2.imwrite(img, frame)
-                                    threading.Thread(
-                                        target=sys.send_email_alert,
-                                        args=(img, v['type'], v['confidence'], cooldown_sec),
-                                        daemon=True).start()
+                    if   score >= 90: level, msg = "success", "Excellent Safety Compliance!"
+                    elif score >= 70: level, msg = "warning", "Good Compliance – minor issues."
+                    else:             level, msg = "danger",  "Poor Compliance – immediate action required!"
+                    alert_ph.markdown(alert_banner(level, msg), unsafe_allow_html=True)
 
-                            time.sleep(0.05)
-                    finally:
-                        cap.release()
+                    # Email alerts: only when BOTH cooldown elapsed AND compliance < threshold
+                    if email_alerts and detections['violations'] and score < alert_compliance_threshold:
+                        frame_bgr = latest.get("frame")
+                        for v in detections['violations']:
+                            ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            img_path = os.path.join(PHOTO_DIR,
+                                                    f"violation_{v['type'].replace(' ','_')}_{ts}.jpg")
+                            if frame_bgr is not None:
+                                cv2.imwrite(img_path, frame_bgr)
+                            threading.Thread(
+                                target=sys.send_email_alert,
+                                args=(img_path, v['type'], v['confidence'], cooldown_sec),
+                                daemon=True).start()
 
     # ── Tab 2: Analytics ──────────────────────────────────────────────────────
     with tab2:
