@@ -1,0 +1,37 @@
+# Version control
+.git/
+.github/
+.gitignore
+
+# Environment and secrets
+.env
+*.env
+
+# Virtual environments
+venv/
+env/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Notebooks and docs
+*.ipynb
+*.docx
+*.md
+!requirements.txt
+
+# Visual assets not needed at runtime
+Visuals/
+
+# IDE and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+.DS_Store
+
+# Docker files (prevent recursive copies)
+Dockerfile
+docker-compose.yml
+.dockerignore
